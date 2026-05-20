@@ -1,0 +1,419 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 19 21:48:58 2026
+
+@author: evan-
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Tue May 12 12:56:08 2026
+
+@author: evan-
+"""
+
+import pandas as pd
+from xgboost import XGBClassifier, XGBRegressor
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, log_loss
+import matplotlib.pyplot as plt
+import seaborn as sns
+import xgboost as xgb
+from datetime import datetime
+
+df = pd.read_csv(r"C:\Users\evan-\OneDrive\Documents\large_dataset.csv")
+print(df.head())
+
+
+# 1. PREPROCESSING
+# Chronological order for Elo
+df = df.iloc[::-1].reset_index(drop=True) 
+
+def calculate_elo(df, k_factor=32):
+    elo_dict = {}  # Stores current elo of every fighter
+    r_elo_list = []
+    b_elo_list = []
+    
+    for idx, row in df.iterrows():
+        r_fighter = row['r_fighter']
+        b_fighter = row['b_fighter']
+        
+        # Initialize new fighters at 1500
+        r_rating = elo_dict.get(r_fighter, 1500)
+        b_rating = elo_dict.get(b_fighter, 1500)
+        
+        #Prefight elo
+        r_elo_list.append(r_rating)
+        b_elo_list.append(b_rating)
+        
+        # Expected Scores Post
+        exp_r = 1 / (1 + 10 ** ((b_rating - r_rating) / 400))
+        exp_b = 1 / (1 + 10 ** ((r_rating - b_rating) / 400))
+        
+        # Actual scores for Comparison
+        if row['winner'] == 'Red':
+            s_r, s_b = 1, 0
+        elif row['winner'] == 'Blue':
+            s_r, s_b = 0, 1
+        else: # Draw or No Contest
+            s_r, s_b = 0.5, 0.5
+            
+        # Update ratings
+        elo_dict[r_fighter] = r_rating + k_factor * (s_r - exp_r)
+        elo_dict[b_fighter] = b_rating + k_factor * (s_b - exp_b)
+        
+    df['r_elo'] = r_elo_list
+    df['b_elo'] = b_elo_list
+    df['elo_diff'] = df['r_elo'] - df['b_elo']
+    return df
+
+# Apply Elo
+df = calculate_elo(df)
+
+# 2. FEATURE SELECTION
+# Use the new Elo features plus some physical stats
+features = ['r_elo', 'b_elo', 'elo_diff', 'r_age', 'b_age', 'r_height', 'b_height', 
+    'r_reach', 'b_reach','r_sig_str_acc_total', 'b_sig_str_acc_total']
+
+# Drop rows with missing values in our selected features
+df_model = df[features + ['winner']].dropna()
+
+# Encode Target: Red = 0, Blue = 1 (binary)
+# Note: Ignore draws for this basic binary classifier
+df_model = df_model[df_model['winner'].isin(['Red', 'Blue'])]
+y = df_model['winner'].map({'Red': 0, 'Blue': 1})
+X = df_model[features]
+
+# 3. XGBOOST MODELING
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+model = xgb.XGBClassifier(n_estimators=100,learning_rate=0.05,
+    max_depth=4, subsample=0.8, colsample_bytree=0.8, 
+    use_label_encoder=False,
+    eval_metric='logloss')
+
+model.fit(X_train, y_train)
+
+# 4. EVALUATION
+preds = model.predict(X_test)
+probs = model.predict_proba(X_test)[:, 1]
+
+print(f"Accuracy: {accuracy_score(y_test, preds):.2%}")
+print(f"Log Loss: {log_loss(y_test, probs):.4f}")
+
+# Check feature importance
+importance = pd.Series(model.feature_importances_, index=features).sort_values(ascending=False)
+print("\nTop Features:\n", importance)
+
+# 5. NEW FUNCTION: CALCULATE FIGHT IMPORTANCE
+def calculate_fight_importance(r_fighter_elo, b_fighter_elo, title_implications=False, 
+                                streak_multiplier=1.0, rivalry_multiplier=1.0,
+                                ranking_position=0, event_prestige=1.0):
+    """
+    Calculate the importance of a fight to a match based on multiple factors
+    
+    Parameters:
+    - r_fighter_elo, b_fighter_elo: Current Elo ratings
+    - title_implications: Boolean for title shot implications
+    - streak_multiplier: Win streak impact (1.0 = normal)
+    - rivalry_multiplier: Historical rivalry impact (1.0 = normal)
+    - ranking_position: Combined ranking of fighters (lower = more important)
+    - event_prestige: PPV/Prelim multiplier (1.0 = normal)
+    
+    Returns:
+    - importance_score: 0-100 scale
+    - breakdown: Dictionary of individual factor scores
+    """
+    # Elo quality factor (higher ranked fighters = more important)
+    avg_elo = (r_fighter_elo + b_fighter_elo) / 2
+    elo_quality = min(100, (avg_elo - 1200) / 4)  # 1200 is beginner, 2000+ is elite
+    elo_quality = max(0, elo_quality)
+    
+    # Elo competitiveness factor (close matches are more important)
+    elo_diff = abs(r_fighter_elo - b_fighter_elo)
+    competitiveness = max(0, 100 - (elo_diff / 8))  # 0 diff = 100, 800 diff = 0
+    competitiveness = min(100, competitiveness)
+    
+    # Title implications factor
+    title_factor = 40 if title_implications else 0
+    
+    # Streak factor (more weight for fighters on streaks)
+    streak_factor = streak_multiplier * 20
+    streak_factor = min(20, streak_factor)
+    
+    # Rivalry factor
+    rivalry_factor = rivalry_multiplier * 15
+    rivalry_factor = min(15, rivalry_factor)
+    
+    # Ranking factor (top 15 is important)
+    ranking_factor = max(0, 20 - (ranking_position / 2))
+    ranking_factor = min(20, ranking_factor)
+    
+    # Event prestige factor
+    prestige_factor = event_prestige * 10
+    
+    # Total importance score
+    importance_score = (elo_quality * 0.25 +  # 25% weight
+                       competitiveness * 0.25 +  # 25% weight
+                       title_factor +  # 40% max
+                       streak_factor +  # 20% max
+                       rivalry_factor +  # 15% max
+                       ranking_factor +  # 20% max
+                       prestige_factor)  # 10% max
+    
+    importance_score = min(100, importance_score)
+    
+    breakdown = {
+        'Fighter Quality (Elo)': round(elo_quality, 2),
+        'Competitiveness': round(competitiveness, 2),
+        'Title Implications': title_factor,
+        'Win Streaks': round(streak_factor, 2),
+        'Rivalry': round(rivalry_factor, 2),
+        'Ranking Impact': round(ranking_factor, 2),
+        'Event Prestige': round(prestige_factor, 2)
+    }
+    
+    return importance_score, breakdown
+
+# 6. FUNCTION TO DISPLAY FIGHT IMPORTANCE WITH VISUALIZATION
+def display_fight_importance(r_fighter, b_fighter, r_elo, b_elo, **kwargs):
+    """
+    Display fight importance with visual representation
+    """
+    importance_score, breakdown = calculate_fight_importance(r_elo, b_elo, **kwargs)
+    
+    print("\n" + "="*60)
+    print(f"FIGHT IMPORTANCE ANALYSIS: {r_fighter} vs {b_fighter}")
+    print("="*60)
+    
+    # Determine importance category
+    if importance_score >= 80:
+        category = "💎 LEGENDARY FIGHT 💎"
+        color = '\033[91m'  # Red
+    elif importance_score >= 60:
+        category = "⭐ MAIN EVENT WORTHY ⭐"
+        color = '\033[93m'  # Yellow
+    elif importance_score >= 40:
+        category = "📺 CO-MAIN EVENT QUALITY 📺"
+        color = '\033[92m'  # Green
+    elif importance_score >= 20:
+        category = "📱 PRELIM HEADLINER 📱"
+        color = '\033[94m'  # Blue
+    else:
+        category = "🎪 EARLY PRELIMS 🎪"
+        color = '\033[90m'  # Dark gray
+    
+    print(f"\n{color}Overall Importance Score: {importance_score:.1f}/100{'\033[0m'}")
+    print(f"Importance Level: {category}")
+    
+    # Visual bar
+    bar_length = int(importance_score / 2)
+    bar = "█" * bar_length + "░" * (50 - bar_length)
+    print(f"\n[{bar}] {importance_score:.1f}%")
+    
+    print("\n--- Importance Breakdown ---")
+    for factor, score in breakdown.items():
+        if score > 0:
+            mini_bar = "█" * int(score / 2) + "░" * (20 - int(score / 2))
+            print(f"{factor:20}: {score:5.1f} {mini_bar}")
+    
+    # Significance explanation
+    print("\n--- Significance to the Match ---")
+    if importance_score >= 70:
+        print("✓ This fight has MAJOR divisional implications")
+        print("✓ Winner likely gets a title shot or moves into top contention")
+        print("✓ Loser faces significant setback in rankings")
+    elif importance_score >= 50:
+        print("✓ High-stakes matchup that could reshape the division")
+        print("✓ Both fighters are at critical points in their careers")
+        print("✓ Winner moves into title contention discussion")
+    elif importance_score >= 30:
+        print("✓ Important fight for divisional rankings")
+        print("✓ Winner takes a step up in competition quality")
+        print("✓ Both fighters looking to build momentum")
+    else:
+        print("✓ Lower stakes but important for career development")
+        print("✓ Fighters looking to establish themselves")
+        print("✓ Building experience and fan recognition")
+    
+    return importance_score
+
+# 7. SIMULATION FOR SEAN STRICKLAND VS KHAMZAT CHIMAEV
+def simulate_fight(r_fighter, b_fighter, r_stats, b_stats, model, feature_list, n_simulations=10000):
+    """
+    Monte Carlo simulation for a specific fight
+    """
+    print("\n" + "="*60)
+    print(f"SIMULATION: {r_fighter} vs {b_fighter}")
+    print("="*60)
+    
+    # Create feature array for prediction
+    features = np.array([[
+        r_stats['elo'], b_stats['elo'], r_stats['elo'] - b_stats['elo'],
+        r_stats['age'], b_stats['age'],
+        r_stats['height'], b_stats['height'],
+        r_stats['reach'], b_stats['reach'],
+        r_stats['sig_str_acc'], b_stats['sig_str_acc']
+    ]])
+    
+    # Get base probability
+    base_prob = model.predict_proba(features)[0][1]  # Probability Blue wins
+    
+    # Monte Carlo simulation with variance
+    sim_results = []
+    for _ in range(n_simulations):
+        # Add some variance to simulate fight outcomes
+        variance = np.random.normal(0, 0.05)  # 5% standard deviation
+        sim_prob = base_prob + variance
+        sim_prob = np.clip(sim_prob, 0, 1)
+        
+        # Determine winner
+        outcome = np.random.random() < sim_prob
+        sim_results.append(1 if outcome else 0)  # 1 = Blue wins, 0 = Red wins
+    
+    blue_win_pct = np.mean(sim_results) * 100
+    red_win_pct = 100 - blue_win_pct
+    
+    # Calculate confidence intervals
+    confidence_interval = np.percentile(sim_results, [2.5, 97.5]) * 100
+    
+    print(f"\n📊 Monte Carlo Results (based on {n_simulations:,} simulations):")
+    print(f"   {r_fighter}: {red_win_pct:.1f}% win probability")
+    print(f"   {b_fighter}: {blue_win_pct:.1f}% win probability")
+    print(f"\n95% Confidence Interval for {b_fighter}: {confidence_interval[0]:.1f}% - {confidence_interval[1]:.1f}%")
+    
+    # Fight outcome scenarios
+    print("\n🎲 Most Likely Scenarios:")
+    if blue_win_pct > 60:
+        print(f"   ✓ {b_fighter} is the clear favorite")
+        print(f"   ✓ Expected method: Decision or Late TKO")
+    elif blue_win_pct > 50:
+        print(f"   ✓ {b_fighter} is a slight favorite")
+        print(f"   ✓ Competitive fight expected")
+    elif red_win_pct > 60:
+        print(f"   ✓ {r_fighter} is the clear favorite")
+        print(f"   ✓ Expected method: Decision or Late TKO")
+    else:
+        print(f"   ✓ Extremely competitive matchup")
+        print(f"   ✓ Could go either way")
+    
+    return {'red_win': red_win_pct, 'blue_win': blue_win_pct}
+
+# 8. SIMULATE STRICKLAND VS CHIMAEV
+print("\n" + "🔥"*30)
+print("KHAMZAT CHIMAEV vs SEAN STRICKLAND - FIGHT SIMULATION")
+print("🔥"*30)
+
+# Fighter statistics (approximated based on their careers)
+strickland_stats = {
+    'name': 'Sean Strickland',
+    'elo': 1850,  # Top 5-10 middleweight
+    'age': 33,
+    'height': 73,  # inches
+    'reach': 76,
+    'sig_str_acc': 48  # significant striking accuracy %
+}
+
+chimaev_stats = {
+    'name': 'Khamzat Chimaev',
+    'elo': 1950,  # Higher undefeated hype
+    'age': 30,
+    'height': 74,
+    'reach': 75,
+    'sig_str_acc': 58
+}
+
+# Get fight importance
+fight_importance = display_fight_importance(
+    strickland_stats['name'], chimaev_stats['name'],
+    strickland_stats['elo'], chimaev_stats['elo'],
+    title_implications=True,  # Title shot implications
+    streak_multiplier=1.5,    # Chimaev's undefeated streak
+    rivalry_multiplier=1.2,   # Style clash rivalry
+    ranking_position=5,       # Both top 10 fighters
+    event_prestige=1.5        # PPV main event
+)
+
+# Run simulation
+simulation_results = simulate_fight(
+    strickland_stats['name'], chimaev_stats['name'],
+    strickland_stats, chimaev_stats,
+    model, features, n_simulations=10000
+)
+
+# Additional fight analysis
+print("\n" + "="*60)
+print("DETAILED FIGHT ANALYSIS")
+print("="*60)
+
+print("\n📊 Key Matchup Factors:")
+print(f"   ✓ Striking: {strickland_stats['sig_str_acc']}% (Strickland) vs {chimaev_stats['sig_str_acc']}% (Chimaev)")
+print(f"   ✓ Wrestling: Chimaev has significant advantage")
+print(f"   ✓ Cardio: Strickland known for high output, Chimaev untested past 3 rounds")
+print(f"   ✓ Experience: Strickland (30+ fights) vs Chimaev (13 fights)")
+
+print("\n🎯 Keys to Victory:")
+if simulation_results['blue_win'] > 50:
+    print(f"   For {chimaev_stats['name']}:")
+    print("      - Use wrestling to neutralize striking")
+    print("      - Push pace early and secure takedowns")
+    print("      - Avoid striking exchanges with Strickland's jab")
+    print(f"\n   For {strickland_stats['name']}:")
+    print("      - Maintain distance with teeps and jabs")
+    print("      - Survive early wrestling attempts")
+    print("      - Push into later rounds where Chimaev is untested")
+else:
+    print(f"   For {strickland_stats['name']}:")
+    print("      - Use volume striking to overwhelm")
+    print("      - Circle away from takedown attempts")
+    print(f"\n   For {chimaev_stats['name']}:")
+    print("      - Secure early takedown and control")
+    print("      - Avoid Strickland's jab range")
+
+# Display visual comparison
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+# Win probability pie chart
+win_probs = [simulation_results['red_win'], simulation_results['blue_win']]
+fighters = [strickland_stats['name'], chimaev_stats['name']]
+colors = ['#ff9999', '#66b3ff']
+ax1.pie(win_probs, labels=fighters, autopct='%1.1f%%', colors=colors, startangle=90)
+ax1.set_title('Win Probability Distribution', fontsize=14, fontweight='bold')
+
+# Radar chart for fighter comparison
+categories = ['Elo Rating', 'Striking Acc', 'Experience', 'Wrestling', 'Cardio', 'Power']
+strickland_scores = [85, 48, 95, 60, 90, 75]
+chimaev_scores = [90, 58, 60, 95, 75, 90]
+
+angles = np.linspace(0, 2*np.pi, len(categories), endpoint=False).tolist()
+angles += angles[:1]
+
+strickland_scores += strickland_scores[:1]
+chimaev_scores += chimaev_scores[:1]
+
+ax2.plot(angles, strickland_scores, 'o-', linewidth=2, label=strickland_stats['name'])
+ax2.plot(angles, chimaev_scores, 'o-', linewidth=2, label=chimaev_stats['name'])
+ax2.fill(angles, strickland_scores, alpha=0.25)
+ax2.fill(angles, chimaev_scores, alpha=0.25)
+ax2.set_xticks(angles[:-1])
+ax2.set_xticklabels(categories)
+ax2.set_ylim(0, 100)
+ax2.set_title('Fighter Attribute Comparison', fontsize=14, fontweight='bold')
+ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0))
+
+plt.tight_layout()
+plt.show()
+
+print("\n" + "="*60)
+print("🏆 FINAL PREDICTION")
+print("="*60)
+if simulation_results['blue_win'] > simulation_results['red_win']:
+    print(f"✅ PREDICTION: {chimaev_stats['name']} wins by Decision or Late TKO")
+    if fight_importance > 70:
+        print("🏆 This win would likely earn Chimaev a Middleweight Title Shot!")
+else:
+    print(f"✅ PREDICTION: {strickland_stats['name']} wins by Decision")
+    if fight_importance > 70:
+        print("🏆 Strickland cements himself as top contender!")
